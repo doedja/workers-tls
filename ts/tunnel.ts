@@ -89,7 +89,7 @@ export async function openTunnel(
   port: number,
   options: TunnelOptions = {},
 ): Promise<Tunnel> {
-  const p = typeof proxy === "string" ? parseProxy(proxy) : proxy;
+  const p = checkProxy(typeof proxy === "string" ? parseProxy(proxy) : proxy);
   const target = checkTarget(host, port);
   const { signal } = options;
   signal?.throwIfAborted();
@@ -99,8 +99,7 @@ export async function openTunnel(
   try {
     const answer = new Answer(stream.read);
     if (p.protocol === "http") await httpConnect(stream, answer, p, target, port);
-    else if (p.protocol === "socks5") await socks5Connect(stream, answer, p, target, port);
-    else throw new Error(`proxy protocol ${String(p.protocol)} is not supported`);
+    else await socks5Connect(stream, answer, p, target, port);
     return withFirst(stream, answer.rest());
   } catch (err) {
     await stream.close();
@@ -121,7 +120,6 @@ function parseProxy(url: string): ProxyConfig {
   }
   const protocol = u.protocol === "http:" ? "http" : u.protocol === "socks5:" || u.protocol === "socks5h:" ? "socks5" : null;
   if (!protocol) throw new Error(`proxy scheme ${u.protocol} is not supported (http:, socks5:)`);
-  if (!u.hostname) throw new Error("proxy URL has no host");
   const config: ProxyConfig = {
     protocol,
     hostname: u.hostname.replace(/^\[(.*)\]$/, "$1"),
@@ -129,10 +127,22 @@ function parseProxy(url: string): ProxyConfig {
     port: u.port ? Number(u.port) : protocol === "http" ? 80 : 1080,
   };
   if (u.username || u.password) {
-    config.username = decodeURIComponent(u.username);
-    config.password = decodeURIComponent(u.password);
+    try {
+      config.username = decodeURIComponent(u.username);
+      config.password = decodeURIComponent(u.password);
+    } catch {
+      throw new Error("proxy URL is not valid");
+    }
   }
   return config;
+}
+
+/** A config checked before anything connects. */
+function checkProxy(p: ProxyConfig): ProxyConfig {
+  if (p.protocol !== "http" && p.protocol !== "socks5") throw new Error(`proxy protocol ${String(p.protocol)} is not supported (http, socks5)`);
+  if (!p.hostname) throw new Error("proxy has no host");
+  if (!Number.isInteger(p.port) || p.port < 1 || p.port > 65535) throw new Error(`proxy port ${p.port} is not valid`);
+  return p;
 }
 
 /** The target as it goes on the wire: a name, an IPv4 address or an IPv6 address without brackets. */
@@ -143,7 +153,11 @@ function checkTarget(host: string, port: number): string {
     ipv6Bytes(bare);
     return bare;
   }
-  if (!/^[A-Za-z0-9._-]{1,253}$/.test(host)) throw new Error("target host is not a valid name or address");
+  // A dotted number that is not plain IPv4 (`010.0.0.1`, `1.2.3`) is refused:
+  // proxies differ on whether such a name is octal, so it could reach different hosts.
+  if (!/^[A-Za-z0-9._-]{1,253}$/.test(host) || (/^[0-9.]+$/.test(host) && !ipv4Bytes(host))) {
+    throw new Error("target host is not a valid name or address");
+  }
   return host;
 }
 
@@ -204,26 +218,31 @@ function socksAddress(host: string): Uint8Array {
   return concat(Uint8Array.of(3, name.length), name);
 }
 
+const IPV4_PART = "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
+/** Plain dotted-decimal IPv4 only: four parts of 0-255, no leading zeros. */
+const IPV4 = new RegExp(`^${IPV4_PART}\\.${IPV4_PART}\\.${IPV4_PART}\\.${IPV4_PART}$`);
+
 function ipv4Bytes(s: string): Uint8Array | null {
-  const parts = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s)?.slice(1).map(Number);
-  return parts && parts.every((n) => n <= 255) ? Uint8Array.from(parts) : null;
+  const parts = IPV4.exec(s)?.slice(1).map(Number);
+  return parts ? Uint8Array.from(parts) : null;
 }
 
 function ipv6Bytes(s: string): Uint8Array {
   const bad = () => new Error("target host is not a valid IPv6 address");
   const halves = s.split("::");
   if (halves.length > 2) throw bad();
-  const groups = (part: string): number[] => {
+  // An IPv4 tail (`::ffff:192.0.2.7`) only ends the whole address.
+  const groups = (part: string, last: boolean): number[] => {
     if (!part) return [];
     return part.split(":").flatMap((g, i, all) => {
-      const v4 = i === all.length - 1 ? ipv4Bytes(g) : null;
+      const v4 = last && i === all.length - 1 ? ipv4Bytes(g) : null;
       if (v4) return [(v4[0]! << 8) | v4[1]!, (v4[2]! << 8) | v4[3]!];
       if (!/^[0-9a-f]{1,4}$/i.test(g)) throw bad();
       return [parseInt(g, 16)];
     });
   };
-  const head = groups(halves[0]!);
-  const tail = halves.length === 2 ? groups(halves[1]!) : [];
+  const head = groups(halves[0]!, halves.length === 1);
+  const tail = halves.length === 2 ? groups(halves[1]!, true) : [];
   const fill = 8 - head.length - tail.length;
   if (halves.length === 2 ? fill < 1 : fill !== 0) throw bad();
   const out = new Uint8Array(16);
@@ -279,7 +298,10 @@ function withFirst(stream: Tunnel, first: Uint8Array): Tunnel {
       return data ? Promise.resolve(data) : stream.read();
     },
     write: (data) => stream.write(data),
-    close: () => stream.close(),
+    close: () => {
+      pending = null;
+      return stream.close();
+    },
   };
 }
 

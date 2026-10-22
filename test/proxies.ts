@@ -49,7 +49,10 @@ function reader(sock: Socket) {
       return this.take(at + marker.length);
     },
     rest(): Buffer {
+      // Paused until the tunnel's pipe resumes it: a flowing socket with no
+      // data listener drops what arrives.
       sock.off("data", onData);
+      sock.pause();
       return buf;
     },
   };
@@ -78,11 +81,20 @@ async function serve(handler: Handler): Promise<TestProxy> {
   };
 }
 
+/** Writes to the client: whole, or with `slow` one byte at a time, so the answer arrives in pieces. */
+async function send(client: Socket, data: Buffer, slow?: boolean): Promise<void> {
+  if (!slow) return void client.write(data);
+  for (const b of data) {
+    client.write(Buffer.of(b));
+    await new Promise((r) => setTimeout(r, 1));
+  }
+}
+
 /** Answer the client with `reply`, then join it to the local `upstream` port both ways. */
-function join(client: Socket, rest: Buffer, upstream: number, reply: Buffer): Promise<void> {
+function join(client: Socket, rest: Buffer, upstream: number, reply: Buffer, slow?: boolean): Promise<void> {
   return new Promise((resolve) => {
-    const up = netConnect(upstream, "127.0.0.1", () => {
-      client.write(reply);
+    const up = netConnect(upstream, "127.0.0.1", async () => {
+      await send(client, reply, slow);
       if (rest.length) up.write(rest);
       client.pipe(up).pipe(client);
       resolve();
@@ -94,33 +106,39 @@ function join(client: Socket, rest: Buffer, upstream: number, reply: Buffer): Pr
 
 /**
  * An HTTP CONNECT proxy that sends every tunnel to `upstream`, whatever the
- * target. With `auth`, any other Proxy-Authorization gets a 407. `greeting`
- * rides in the same write as the 200.
+ * target. With `auth`, any other Proxy-Authorization gets a 407, and the
+ * connection stays open for another try, so only the client closes it.
+ * `greeting` rides in the same write as the 200. `slow` sends answers a byte
+ * at a time.
  */
-export function httpProxy(upstream: number, opts: { auth?: string; greeting?: string } = {}): Promise<TestProxy> {
+export function httpProxy(upstream: number, opts: { auth?: string; greeting?: string; slow?: boolean } = {}): Promise<TestProxy> {
   return serve(async (client, r, seen) => {
     const [line = "", ...headers] = (await r.until("\r\n\r\n")).toString().split("\r\n");
     const auth = headers.find((h) => /^proxy-authorization:/i.test(h))?.replace(/^[^:]+:\s*/, "");
     seen.push({ target: line.split(" ")[1] ?? "", ...(auth ? { auth } : {}) });
     if (opts.auth !== undefined && auth !== opts.auth) {
-      client.end("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n");
-      return;
+      return send(client, Buffer.from("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\nContent-Length: 0\r\n\r\n"), opts.slow);
     }
-    await join(client, r.rest(), upstream, Buffer.from(`HTTP/1.1 200 Connection established\r\n\r\n${opts.greeting ?? ""}`));
+    await join(client, r.rest(), upstream, Buffer.from(`HTTP/1.1 200 Connection established\r\n\r\n${opts.greeting ?? ""}`), opts.slow);
   });
 }
 
 /**
  * A SOCKS5 proxy (RFC 1928, RFC 1929 when `user` is set) that sends every
  * tunnel to `upstream`. A nonzero `reply` refuses the CONNECT with that code.
+ * `slow` sends answers a byte at a time; `boundName` answers with a bound
+ * address that is a name, which the client has to read past.
  */
-export function socksProxy(upstream: number, opts: { user?: string; pass?: string; reply?: number } = {}): Promise<TestProxy> {
+export function socksProxy(
+  upstream: number,
+  opts: { user?: string; pass?: string; reply?: number; slow?: boolean; boundName?: string } = {},
+): Promise<TestProxy> {
   return serve(async (client, r, seen) => {
     const [version, n = 0] = await r.take(2);
     const methods = [...(await r.take(n))];
     const want = opts.user !== undefined ? 2 : 0;
     if (version !== 5 || !methods.includes(want)) return void client.end(Buffer.from([5, 0xff]));
-    client.write(Buffer.from([5, want]));
+    await send(client, Buffer.from([5, want]), opts.slow);
     let auth: string | undefined;
     if (want === 2) {
       const [, ulen = 0] = await r.take(2);
@@ -132,7 +150,7 @@ export function socksProxy(upstream: number, opts: { user?: string; pass?: strin
         seen.push({ target: "", auth });
         return void client.end(Buffer.from([1, 1]));
       }
-      client.write(Buffer.from([1, 0]));
+      await send(client, Buffer.from([1, 0]), opts.slow);
     }
     const [, , , type = 0] = await r.take(4);
     let host: string;
@@ -144,9 +162,14 @@ export function socksProxy(upstream: number, opts: { user?: string; pass?: strin
     }
     const port = (await r.take(2)).readUInt16BE(0);
     seen.push({ target: `${host}:${port}`, type, ...(auth ? { auth } : {}) });
-    const bound = Buffer.from([5, opts.reply ?? 0, 0, 1, 127, 0, 0, 1, 0x1f, 0x90]);
+    const name = opts.boundName === undefined ? null : Buffer.from(opts.boundName);
+    const bound = Buffer.concat([
+      Buffer.from([5, opts.reply ?? 0, 0]),
+      name ? Buffer.concat([Buffer.from([3, name.length]), name]) : Buffer.from([1, 127, 0, 0, 1]),
+      Buffer.from([0x1f, 0x90]),
+    ]);
     if (opts.reply) return void client.end(bound);
-    await join(client, r.rest(), upstream, bound);
+    await join(client, r.rest(), upstream, bound, opts.slow);
   });
 }
 

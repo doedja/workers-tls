@@ -140,7 +140,7 @@ function taken(x, len) {
  * A TLS client session to `serverName` (SNI and certificate name) over
  * `stream`, after the handshake. Rejects with the TLS error (`invalid peer
  * certificate: ...`, `received fatal alert: ...`) or `closed during handshake`.
- * One `read()` at a time; writes may overlap reads.
+ * One `read()` and one `write()` at a time; a write may overlap a read.
  */
 export async function connectTls(serverName, stream) {
     const x = instance();
@@ -150,7 +150,12 @@ export async function connectTls(serverName, stream) {
     // Handles are never reused, so a call after the drop fails ("no such
     // connection"); `dropped` makes it fail as "connection closed" first.
     let dropped = false;
+    /** Why reading ended, if it failed: later calls throw it. */
+    let failure = null;
+    /** Why a write failed: later writes throw it, while reads go on (the peer may have answered first). */
+    let writeFailure = null;
     let closeNotify = false;
+    let established = false;
     const drop = () => {
         if (dropped)
             return;
@@ -159,7 +164,7 @@ export async function connectTls(serverName, stream) {
             x.wt_drop(h);
     };
     // What goes to the network, in the order rustls produced it, whichever of
-    // read(), write() and close() took it.
+    // read(), write() and close() took it. A failed write fails every send after it.
     let sent = Promise.resolve();
     const send = (out) => {
         if (out.length)
@@ -167,6 +172,21 @@ export async function connectTls(serverName, stream) {
         return sent;
     };
     const flush = () => send(taken(x, x.wt_take_tls(h)));
+    /**
+     * Send what reading produced (handshake messages, alerts, replies to the
+     * peer's key updates). The handshake waits for it to go out. After the
+     * handshake a read never waits on the network taking our writes: with the
+     * peer backed up behind our own upload, that wait would stop the reading
+     * that drains it, and both sides would stall. A failure there fails the
+     * next write.
+     */
+    const flushRead = async () => {
+        const out = flush();
+        if (established)
+            out.catch(() => undefined);
+        else
+            await out;
+    };
     /** Network bytes not yet handed to rustls. */
     let pending = null;
     /** Hand rustls the next piece of network bytes; false at the end of the stream. A TLS error sends its alert, then rejects. */
@@ -183,10 +203,10 @@ export async function connectTls(serverName, stream) {
         const status = withBytes(x, piece, (p, n) => x.wt_feed(h, p, n));
         if (status < 0) {
             const msg = lastError(x);
-            await flush().catch(() => undefined);
+            await flushRead().catch(() => undefined);
             throw new Error(msg);
         }
-        await flush();
+        await flushRead();
         return true;
     };
     try {
@@ -200,6 +220,7 @@ export async function connectTls(serverName, stream) {
         drop();
         throw err;
     }
+    established = true;
     const v = x.wt_version(h);
     const version = v === 0x0304 ? "TLS1.3" : v === 0x0303 ? "TLS1.2" : "TLS";
     return {
@@ -222,18 +243,23 @@ export async function connectTls(serverName, stream) {
                 }
             }
             catch (err) {
+                failure ??= err;
                 drop();
                 throw err;
             }
+            if (failure)
+                throw failure;
             // The end frees the connection; nothing more can arrive.
             drop();
             return undefined;
         },
         async write(data) {
+            if (writeFailure)
+                throw writeFailure;
             try {
                 for (let off = 0; off < data.length; off += CHUNK) {
                     if (dropped)
-                        throw new Error("connection closed");
+                        throw failure ?? new Error("connection closed");
                     const status = withBytes(x, data.subarray(off, off + CHUNK), (p, n) => x.wt_send(h, p, n));
                     if (status < 0)
                         throw new Error(lastError(x));
@@ -241,7 +267,7 @@ export async function connectTls(serverName, stream) {
                 }
             }
             catch (err) {
-                drop();
+                writeFailure ??= err;
                 throw err;
             }
         },

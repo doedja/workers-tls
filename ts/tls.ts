@@ -24,14 +24,22 @@ export interface ByteStream {
 }
 
 export interface TlsConnection {
-  /** Decrypted bytes, or undefined at the end: the peer's close_notify, or the stream ending. */
+  /**
+   * Decrypted bytes, or undefined at the end: the peer's close_notify, or the
+   * stream ending. One call at a time. It never waits for writes to go out.
+   */
   read(): Promise<Uint8Array | undefined>;
+  /**
+   * Resolves once the stream took the bytes. One call at a time. A failed
+   * write fails every write after it, while reads go on: the peer may have
+   * answered before it stopped reading.
+   */
   write(data: Uint8Array): Promise<void>;
   /**
    * Frees the connection, then sends close_notify after anything still being
    * sent; the stream itself is the caller's to close. The end of the stream,
-   * the peer's close_notify and an error free it too, so a connection read to
-   * its end needs no close.
+   * the peer's close_notify and a read error free it too, so a connection
+   * read to its end needs no close.
    */
   close(): Promise<void>;
   /** "TLS1.2" or "TLS1.3". */
@@ -192,7 +200,7 @@ function taken(x: Exports, len: number): Uint8Array {
  * A TLS client session to `serverName` (SNI and certificate name) over
  * `stream`, after the handshake. Rejects with the TLS error (`invalid peer
  * certificate: ...`, `received fatal alert: ...`) or `closed during handshake`.
- * One `read()` at a time; writes may overlap reads.
+ * One `read()` and one `write()` at a time; a write may overlap a read.
  */
 export async function connectTls(serverName: string, stream: ByteStream): Promise<TlsConnection> {
   const x = instance();
@@ -201,20 +209,38 @@ export async function connectTls(serverName: string, stream: ByteStream): Promis
   // Handles are never reused, so a call after the drop fails ("no such
   // connection"); `dropped` makes it fail as "connection closed" first.
   let dropped = false;
+  /** Why reading ended, if it failed: later calls throw it. */
+  let failure: unknown = null;
+  /** Why a write failed: later writes throw it, while reads go on (the peer may have answered first). */
+  let writeFailure: unknown = null;
   let closeNotify = false;
+  let established = false;
   const drop = () => {
     if (dropped) return;
     dropped = true;
     if (live === x) x.wt_drop(h);
   };
   // What goes to the network, in the order rustls produced it, whichever of
-  // read(), write() and close() took it.
+  // read(), write() and close() took it. A failed write fails every send after it.
   let sent: Promise<void> = Promise.resolve();
   const send = (out: Uint8Array): Promise<void> => {
     if (out.length) sent = sent.then(() => stream.write(out));
     return sent;
   };
   const flush = () => send(taken(x, x.wt_take_tls(h)));
+  /**
+   * Send what reading produced (handshake messages, alerts, replies to the
+   * peer's key updates). The handshake waits for it to go out. After the
+   * handshake a read never waits on the network taking our writes: with the
+   * peer backed up behind our own upload, that wait would stop the reading
+   * that drains it, and both sides would stall. A failure there fails the
+   * next write.
+   */
+  const flushRead = async () => {
+    const out = flush();
+    if (established) out.catch(() => undefined);
+    else await out;
+  };
   /** Network bytes not yet handed to rustls. */
   let pending: Uint8Array | null = null;
   /** Hand rustls the next piece of network bytes; false at the end of the stream. A TLS error sends its alert, then rejects. */
@@ -230,10 +256,10 @@ export async function connectTls(serverName: string, stream: ByteStream): Promis
     const status = withBytes(x, piece, (p, n) => x.wt_feed(h, p, n));
     if (status < 0) {
       const msg = lastError(x);
-      await flush().catch(() => undefined);
+      await flushRead().catch(() => undefined);
       throw new Error(msg);
     }
-    await flush();
+    await flushRead();
     return true;
   };
   try {
@@ -245,6 +271,7 @@ export async function connectTls(serverName: string, stream: ByteStream): Promis
     drop();
     throw err;
   }
+  established = true;
   const v = x.wt_version(h);
   const version = v === 0x0304 ? "TLS1.3" : v === 0x0303 ? "TLS1.2" : "TLS";
   return {
@@ -264,23 +291,26 @@ export async function connectTls(serverName: string, stream: ByteStream): Promis
           if (!(await pump())) break;
         }
       } catch (err) {
+        failure ??= err;
         drop();
         throw err;
       }
+      if (failure) throw failure;
       // The end frees the connection; nothing more can arrive.
       drop();
       return undefined;
     },
     async write(data) {
+      if (writeFailure) throw writeFailure;
       try {
         for (let off = 0; off < data.length; off += CHUNK) {
-          if (dropped) throw new Error("connection closed");
+          if (dropped) throw failure ?? new Error("connection closed");
           const status = withBytes(x, data.subarray(off, off + CHUNK), (p, n) => x.wt_send(h, p, n));
           if (status < 0) throw new Error(lastError(x));
           await flush();
         }
       } catch (err) {
-        drop();
+        writeFailure ??= err;
         throw err;
       }
     },

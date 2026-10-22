@@ -20,6 +20,7 @@ const servers: NodeTlsServer[] = [];
 const proxies: TestProxy[] = [];
 let tls12: NodeTlsServer;
 let tls13: NodeTlsServer;
+let pipe13: NodeTlsServer;
 
 async function freePort(): Promise<number> {
   const s = createServer();
@@ -32,7 +33,8 @@ async function freePort(): Promise<number> {
 beforeAll(async () => {
   tls12 = await nodeTlsServer(fixturePath("server.key"), fixturePath("server.pem"), "http", "TLSv1.2");
   tls13 = await nodeTlsServer(fixturePath("server.key"), fixturePath("server.pem"), "http", "TLSv1.3");
-  servers.push(tls12, tls13);
+  pipe13 = await nodeTlsServer(fixturePath("server.key"), fixturePath("server.pem"), "pipe", "TLSv1.3");
+  servers.push(tls12, tls13, pipe13);
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   wrangler = spawn(
@@ -67,8 +69,8 @@ afterAll(() => {
   for (const p of proxies) p.close();
 });
 
-async function viaWorker(path: string, port: number, proxy?: string) {
-  const q = new URLSearchParams({ port: String(port), ...(proxy ? { proxy } : {}) });
+async function viaWorker(path: string, port: number, proxy?: string, extra: Record<string, string> = {}) {
+  const q = new URLSearchParams({ port: String(port), ...(proxy ? { proxy } : {}), ...extra });
   const res = await fetch(`${base}${path}?${q}`);
   return (await res.json()) as unknown;
 }
@@ -78,7 +80,8 @@ describe("in workerd", () => {
     expect(await viaWorker("/direct13", tls13.port)).toEqual({ version: "TLS1.3", body: { success: true, path: "/direct13" } });
     expect(await viaWorker("/direct12", tls12.port)).toEqual({ version: "TLS1.2", body: { success: true, path: "/direct12" } });
     await tls12.seen(1);
-    expect(tls12.conns[0]?.sni).toBe("tls.test");
+    await tls13.seen(1);
+    expect([tls13.conns[0]?.sni, tls12.conns[0]?.sni]).toEqual(["tls.test", "tls.test"]);
   });
 
   test("through an HTTP CONNECT proxy with credentials", async () => {
@@ -89,6 +92,8 @@ describe("in workerd", () => {
       body: { success: true, path: "/connect" },
     });
     expect(proxy.seen).toEqual([{ target: "tls.test:443", auth: `Basic ${btoa("user:pass")}` }]);
+    await tls12.seen(2);
+    expect(tls12.conns.at(-1)?.sni).toBe("tls.test");
   });
 
   test("through a SOCKS5 proxy with credentials", async () => {
@@ -99,6 +104,12 @@ describe("in workerd", () => {
       body: { success: true, path: "/socks" },
     });
     expect(proxy.seen).toEqual([{ target: "tls.test:443", type: 3, auth: "user:pass" }]);
+    await tls13.seen(2);
+    expect(tls13.conns.at(-1)?.sni).toBe("tls.test");
+  });
+
+  test("a large write and a read at once, against an echo server with backpressure", async () => {
+    expect(await viaWorker("/pipe", pipe13.port, undefined, { mb: "16" })).toEqual({ got: 16 * 1024 * 1024 });
   });
 
   test("a certificate for another name is refused", async () => {

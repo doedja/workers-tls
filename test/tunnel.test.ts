@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createServer, type Server, type TLSSocket } from "node:tls";
 import { fileURLToPath } from "node:url";
-import { connectTls, initTls, openTunnel, pemToDer, socketStream, type ByteStream } from "../ts/index.js";
+import { connectTls, initTls, openTunnel, pemToDer, socketStream, type ByteStream, type ProxyConfig } from "../ts/index.js";
 import { nodeConnect } from "./node-socket.js";
 import { nodeTlsServer, type NodeTlsServer } from "./node-tls-server.js";
 import { hangUpProxy, httpProxy, silentProxy, socksProxy, type TestProxy } from "./proxies.js";
@@ -17,6 +17,8 @@ const dec = new TextDecoder();
 let http12: NodeTlsServer;
 /** TLS 1.3, echoes upper-cased. */
 let echo13 = 0;
+/** TLS 1.3, echoes with backpressure. */
+let pipe13: NodeTlsServer;
 const servers: Server[] = [];
 const proxies: TestProxy[] = [];
 const track = (p: TestProxy) => (proxies.push(p), p);
@@ -24,6 +26,7 @@ const track = (p: TestProxy) => (proxies.push(p), p);
 beforeAll(async () => {
   initTls(wasm, pemToDer(readFileSync(fixturePath("ca.pem"), "utf8")));
   http12 = await nodeTlsServer(fixturePath("server.key"), fixturePath("server.pem"), "http", "TLSv1.2");
+  pipe13 = await nodeTlsServer(fixturePath("server.key"), fixturePath("server.pem"), "pipe", "TLSv1.3");
   const server = createServer({ key: readFileSync(fixturePath("server.key")), cert: readFileSync(fixturePath("server.pem")), minVersion: "TLSv1.3" }, (s: TLSSocket) =>
     s.on("data", (d: Buffer) => s.write(d.toString().toUpperCase())),
   );
@@ -34,6 +37,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   http12.close();
+  pipe13.close();
   for (const s of servers) s.close();
   for (const p of proxies) p.close();
 });
@@ -66,6 +70,27 @@ describe("socketStream", () => {
     await http12.seen(before + 1);
     expect(http12.conns.at(-1)).toEqual({ protocol: "TLSv1.2", reused: false, sni: "tls.test" });
   });
+
+  test("a large write and a read at once, against a peer that stops reading while its answer is not read", async () => {
+    // The peer echoes with backpressure. A read that waited for our writes to
+    // go out would stall both sides after a few MB.
+    const total = 16 * 1024 * 1024;
+    const piece = new Uint8Array(1024 * 1024).fill(0x61);
+    const stream = socketStream(nodeConnect({ hostname: "127.0.0.1", port: pipe13.port }));
+    const tls = await connectTls("tls.test", stream);
+    const writing = (async () => {
+      for (let sent = 0; sent < total; sent += piece.length) await tls.write(piece);
+    })();
+    let got = 0;
+    while (got < total) {
+      const d = await tls.read();
+      if (!d) break;
+      got += d.length;
+    }
+    await writing;
+    expect(got).toBe(total);
+    await stream.close();
+  }, 30_000);
 });
 
 describe("HTTP CONNECT", () => {
@@ -92,6 +117,17 @@ describe("HTTP CONNECT", () => {
     const proxy = track(await httpProxy(echo13, { greeting: "early" }));
     const tunnel = await openTunnel(nodeConnect, { protocol: "http", hostname: "127.0.0.1", port: proxy.port }, "tls.test", 443);
     expect(dec.decode(await tunnel.read())).toBe("early");
+    await tunnel.close();
+    // Closed before they were read, they are gone too.
+    const unread = await openTunnel(nodeConnect, `http://127.0.0.1:${proxy.port}`, "tls.test", 443);
+    await unread.close();
+    expect(await unread.read()).toBeUndefined();
+  });
+
+  test("an answer that arrives a byte at a time", async () => {
+    const proxy = track(await httpProxy(http12.port, { slow: true }));
+    const tunnel = await openTunnel(nodeConnect, `http://127.0.0.1:${proxy.port}`, "tls.test", 443);
+    expect(await get(tunnel, "/slow")).toEqual({ version: "TLS1.2", body: { success: true, path: "/slow" } });
     await tunnel.close();
   });
 
@@ -123,6 +159,13 @@ describe("SOCKS5", () => {
     expect(await get(tunnel, "/via-socks")).toEqual({ version: "TLS1.2", body: { success: true, path: "/via-socks" } });
     await tunnel.close();
     expect(proxy.seen).toEqual([{ target: "tls.test:443", type: 3, auth: "user:pässword" }]);
+  });
+
+  test("answers that arrive a byte at a time, with a bound address that is a name", async () => {
+    const proxy = track(await socksProxy(http12.port, { user: "u", pass: "p", slow: true, boundName: "bound.proxy.test" }));
+    const tunnel = await openTunnel(nodeConnect, `socks5://u:p@127.0.0.1:${proxy.port}`, "tls.test", 443);
+    expect(await get(tunnel, "/slow")).toEqual({ version: "TLS1.2", body: { success: true, path: "/slow" } });
+    await tunnel.close();
   });
 
   test("a wrong password and a refused CONNECT are named", async () => {
@@ -181,5 +224,18 @@ describe("openTunnel failures", () => {
     expect(await refused("http://proxy.test", "tls.test\r\nX-Injected: 1")).toBe("target host is not a valid name or address");
     expect(await refused("http://proxy.test", "1::2::3")).toBe("target host is not a valid IPv6 address");
     expect(await refused("http://proxy.test", "tls.test", 0)).toBe("target port 0 is not valid");
+    expect(await refused("http://u:50%off@proxy.test")).toBe("proxy URL is not valid");
+    expect(await refused("socks5://proxy.test:0")).toBe("proxy port 0 is not valid");
+    for (const host of ["1.2.3.4::", "1.2.3.4::5", "::1.2.3.4:5"]) {
+      expect(await refused("socks5://proxy.test", host)).toBe("target host is not a valid IPv6 address");
+    }
+    // Some proxies read these as octal or as shorthand, others as names.
+    for (const host of ["010.0.0.1", "1.2.3", "256.1.1.1"]) {
+      expect(await refused("socks5://proxy.test", host)).toBe("target host is not a valid name or address");
+    }
+    const config = { protocol: "https", hostname: "proxy.test", port: 443 } as unknown as ProxyConfig;
+    expect(await openTunnel(never, config, "tls.test", 443).catch((e: Error) => e.message)).toBe(
+      "proxy protocol https is not supported (http, socks5)",
+    );
   });
 });

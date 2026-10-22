@@ -12,7 +12,7 @@ export interface NodeTlsServer {
 
 const script = fileURLToPath(new URL("./node-tls-server.mjs", import.meta.url));
 
-export async function nodeTlsServer(key: string, cert: string, mode: "echo" | "http" | "ok", maxVersion?: string): Promise<NodeTlsServer> {
+export async function nodeTlsServer(key: string, cert: string, mode: "echo" | "pipe" | "http" | "ok", maxVersion?: string): Promise<NodeTlsServer> {
   const child = spawn("node", [script, key, cert, mode, ...(maxVersion ? [maxVersion] : [])], { stdio: ["pipe", "pipe", "inherit"] });
   const conns: NodeTlsServer["conns"] = [];
   const waiters: Array<() => void> = [];

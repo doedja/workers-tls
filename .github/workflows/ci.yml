@@ -12,11 +12,11 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - run: bun install --frozen-lockfile
@@ -30,11 +30,12 @@ jobs:
   wasm:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain (rust-toolchain.toml pins Rust)
         run: |
           rustup show active-toolchain || rustup toolchain install
           clang --version
+      - run: cargo test --locked
       - run: ./build.sh
       - name: workers_tls.wasm is built from src/
         run: |

@@ -100,12 +100,20 @@ done. `serverName` is both the SNI and the name the certificate must carry.
   or `received fatal alert: ...`, or with `closed during handshake`.
 - `tls.version` is `"TLS1.2"` or `"TLS1.3"`.
 - `tls.read()` returns `undefined` at the end of the stream or after the
-  peer's `close_notify`. Call it one at a time. Writes may overlap it.
+  peer's `close_notify`.
+- Call `read()` one at a time, and `write()` one at a time. A write may run
+  while a read waits, and a read never waits for writes to go out, so an
+  upload and its answer can stream at once.
+- A failed write fails every write after it. Reads go on, because the peer
+  may have answered before it stopped reading, for example an early error
+  status during an upload. A failed read keeps failing; it never looks like
+  the end.
 - Many servers end a connection without `close_notify`. When a body has no
   other framing (no Content-Length or chunking), check `tls.closeNotify`:
   only when it is true do you know the body arrived whole.
-- A connection frees itself when it ends or errors. `tls.close()` frees it,
-  then sends `close_notify`. It doesn't close the stream.
+- A connection frees itself when reading reaches the end or fails.
+  `tls.close()` frees it, then sends `close_notify`. It doesn't close the
+  stream.
 - `stream.write` is called one call at a time, in the order the bytes must go
   out.
 
@@ -120,7 +128,9 @@ it. `connect` is the one from `cloudflare:sockets`.
     with RFC 1929 username and password. The port defaults to 1080.
   - Credentials in a URL are percent-decoded.
   - Both protocols send the target's name, so the proxy resolves it. IPv4
-    and IPv6 targets go as addresses.
+    and IPv6 targets go as addresses. A dotted number that isn't plain IPv4,
+    such as `010.0.0.1`, is refused, because proxies disagree on whether it
+    is octal.
   - HTTPS proxies (TLS to the proxy itself) aren't supported.
 - Errors name the step, never the URL or credentials:
   - `proxy closed the connection`
@@ -218,7 +228,7 @@ bun test
 
 The tests run against local TLS servers, through local HTTP CONNECT and SOCKS5
 proxies, and inside workerd via `wrangler dev` (`test/workerd.test.ts`), with
-the real `cloudflare:sockets`.
+the real `cloudflare:sockets`. `cargo test` covers the Rust side's handles.
 
 The TLS 1.2-only servers run in Node (`test/node-tls-server.mjs`), because
 Bun's `node:tls` before 1.4 ignores `maxVersion`. So `node` must be on the

@@ -127,7 +127,7 @@ describe("workers-tls", () => {
     }
   });
 
-  test("the peer closing ends reads; many connections share one instance", async () => {
+  test("the peer closing ends reads, for twenty connections in a row", async () => {
     const port = await listen({}, (s) => s.end("bye"));
     for (let i = 0; i < 20; i++) {
       const { sock, tls } = await open(port);
@@ -161,6 +161,61 @@ describe("workers-tls", () => {
     expect(await readAll(b, 10)).toBe("STILL MINE");
     await b.close();
     sockB.destroy();
+    sock.destroy();
+  });
+
+  test("a read is not held up by a write the network has not taken", async () => {
+    // The server speaks first after the handshake, reading nothing.
+    const port = await listen({ minVersion: "TLSv1.3" }, (s) => void setTimeout(() => s.write("hello"), 20));
+    const sock = netConnect(port, "127.0.0.1");
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const raw = byteStream(sock);
+    let hold = false;
+    const held: Array<() => void> = [];
+    // After the handshake, writes wait until released: a peer whose receive window is full.
+    const stream: ByteStream = {
+      read: raw.read,
+      write: (d) => (hold ? new Promise<void>((r) => held.push(() => void raw.write(d).then(r))) : raw.write(d)),
+    };
+    const tls = await connectTls("tls.test", stream);
+    hold = true;
+    const writing = tls.write(new Uint8Array(1000).fill(0x61));
+    expect(await readAll(tls, 5)).toBe("hello");
+    hold = false;
+    for (const release of held.splice(0)) release();
+    await writing;
+    await tls.close();
+    sock.destroy();
+  });
+
+  test("after a write fails, reads go on and later writes fail the same way", async () => {
+    const port = await listen({ minVersion: "TLSv1.3" }, (s) => void setTimeout(() => s.write("answer"), 20));
+    const sock = netConnect(port, "127.0.0.1");
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const raw = byteStream(sock);
+    let broken = false;
+    const stream: ByteStream = { read: raw.read, write: (d) => (broken ? Promise.reject(new Error("stream broke")) : raw.write(d)) };
+    const tls = await connectTls("tls.test", stream);
+    broken = true;
+    await expect(tls.write(new TextEncoder().encode("upload"))).rejects.toThrow("stream broke");
+    expect(await readAll(tls, 6)).toBe("answer");
+    await expect(tls.write(new TextEncoder().encode("more"))).rejects.toThrow("stream broke");
+    sock.destroy();
+  });
+
+  test("a read that fails keeps failing, rather than looking like the end", async () => {
+    const port = await listen({ minVersion: "TLSv1.3" }, () => undefined);
+    const sock = netConnect(port, "127.0.0.1");
+    await new Promise<void>((r) => sock.once("connect", () => r()));
+    const raw = byteStream(sock);
+    let garbage = false;
+    const stream: ByteStream = { read: () => (garbage ? Promise.resolve(new Uint8Array(64).fill(0x17)) : raw.read()), write: raw.write };
+    const tls = await connectTls("tls.test", stream);
+    garbage = true;
+    const first = await tls.read().catch((e: Error) => e);
+    expect(first).toBeInstanceOf(Error);
+    await expect(tls.read()).rejects.toBe(first);
+    await expect(tls.write(new Uint8Array(1))).rejects.toBe(first);
     sock.destroy();
   });
 

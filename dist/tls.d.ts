@@ -22,14 +22,22 @@ export interface ByteStream {
     write(data: Uint8Array): Promise<void>;
 }
 export interface TlsConnection {
-    /** Decrypted bytes, or undefined at the end: the peer's close_notify, or the stream ending. */
+    /**
+     * Decrypted bytes, or undefined at the end: the peer's close_notify, or the
+     * stream ending. One call at a time. It never waits for writes to go out.
+     */
     read(): Promise<Uint8Array | undefined>;
+    /**
+     * Resolves once the stream took the bytes. One call at a time. A failed
+     * write fails every write after it, while reads go on: the peer may have
+     * answered before it stopped reading.
+     */
     write(data: Uint8Array): Promise<void>;
     /**
      * Frees the connection, then sends close_notify after anything still being
      * sent; the stream itself is the caller's to close. The end of the stream,
-     * the peer's close_notify and an error free it too, so a connection read to
-     * its end needs no close.
+     * the peer's close_notify and a read error free it too, so a connection
+     * read to its end needs no close.
      */
     close(): Promise<void>;
     /** "TLS1.2" or "TLS1.3". */
@@ -54,6 +62,6 @@ export declare function pemToDer(pem: string): Uint8Array[];
  * A TLS client session to `serverName` (SNI and certificate name) over
  * `stream`, after the handshake. Rejects with the TLS error (`invalid peer
  * certificate: ...`, `received fatal alert: ...`) or `closed during handshake`.
- * One `read()` at a time; writes may overlap reads.
+ * One `read()` and one `write()` at a time; a write may overlap a read.
  */
 export declare function connectTls(serverName: string, stream: ByteStream): Promise<TlsConnection>;

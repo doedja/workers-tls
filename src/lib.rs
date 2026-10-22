@@ -333,3 +333,38 @@ pub extern "C" fn wt_drop(h: u32) -> i32 {
         0
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect(name: &str) -> i32 {
+        unsafe { wt_connect(name.as_ptr(), name.len()) }
+    }
+
+    fn error() -> String {
+        STATE.with(|s| s.borrow().error.clone())
+    }
+
+    #[test]
+    fn a_dropped_handle_is_never_given_out_again() {
+        let a = connect("a.test");
+        assert!(a > 0);
+        assert_eq!(wt_drop(a as u32), 0);
+        let b = connect("b.test");
+        assert!(b > a);
+        // The old handle reaches nothing, not the connection made after it.
+        assert!(wt_state(a as u32) < 0);
+        assert_eq!(error(), "no such connection");
+        assert!(wt_take_tls(a as u32) < 0);
+        // The new one has its ClientHello waiting.
+        assert!(wt_state(b as u32) & 1 == 1);
+        assert!(wt_take_tls(b as u32) > 0);
+    }
+
+    #[test]
+    fn a_bad_server_name_is_refused() {
+        assert!(connect("not a name") < 0);
+        assert!(error().starts_with("bad server name"));
+    }
+}

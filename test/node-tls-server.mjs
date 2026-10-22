@@ -1,11 +1,13 @@
 // A TLS server run by Node, for the tests that need what Bun's node:tls before
 // 1.4 does not do: it ignores maxVersion, so it cannot serve TLS 1.2 only.
 //
-//   node node-tls-server.mjs <key.pem> <cert.pem> <echo|http|ok> [maxVersion]
+//   node node-tls-server.mjs <key.pem> <cert.pem> <echo|pipe|http|ok> [maxVersion]
 //
 // Prints `port <n>`, then `conn <protocol> <reused> <sni>` for each connection.
-// echo: upper-cases what it reads. http: one HTTP/1.1 JSON answer naming the
-// request path. ok: sends "ok" and closes. It exits when its stdin closes.
+// echo: upper-cases what it reads. pipe: echoes with backpressure, so it stops
+// reading while what it sends back is not being read. http: one HTTP/1.1 JSON
+// answer naming the request path. ok: sends "ok" and closes. It exits when its
+// stdin closes.
 import { readFileSync } from "node:fs";
 import { createServer } from "node:tls";
 
@@ -14,6 +16,7 @@ const server = createServer({ key: readFileSync(key), cert: readFileSync(cert), 
   console.log(`conn ${s.getProtocol()} ${s.isSessionReused()} ${s.servername || "-"}`);
   s.on("error", () => undefined);
   if (mode === "ok") return void s.end("ok");
+  if (mode === "pipe") return void s.pipe(s);
   let req = "";
   s.on("data", (d) => {
     if (mode === "echo") return void s.write(d.toString().toUpperCase());
