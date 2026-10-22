@@ -1,0 +1,32 @@
+{
+  "name": "workers-tls",
+  "version": "0.1.0",
+  "description": "TLS 1.2 and 1.3 for Cloudflare Workers sockets (rustls in WebAssembly), with SNI and your own trust anchors, directly or through an HTTP CONNECT or SOCKS5 proxy.",
+  "license": "MIT OR Apache-2.0",
+  "repository": "github:doedja/workers-tls",
+  "keywords": ["cloudflare-workers", "tls", "rustls", "webassembly", "socks5", "http-connect", "proxy"],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./workers_tls.wasm": {
+      "types": "./wasm.d.ts",
+      "default": "./workers_tls.wasm"
+    }
+  },
+  "files": ["dist", "ts", "wasm.d.ts", "workers_tls.wasm", "src", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.sh", "LICENSE-*", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "build:wasm": "./build.sh",
+    "check": "tsc -p tsconfig.test.json",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "typescript": "5.9.3",
+    "wrangler": "4.151.3"
+  }
+}

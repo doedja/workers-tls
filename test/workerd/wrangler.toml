@@ -1,0 +1,9 @@
+# The end-to-end test's Worker (`test/workerd.test.ts`), run locally by `wrangler dev`.
+name = "workers-tls-e2e"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[[rules]]
+type = "Text"
+globs = ["**/*.pem"]
+fallthrough = true

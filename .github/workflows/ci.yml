@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - name: dist/ is built from ts/
+        run: |
+          bunx tsc
+          test -z "$(git status --porcelain dist)" || { git status --porcelain dist; exit 1; }
+      - run: bunx tsc -p tsconfig.test.json
+      - run: bun test
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml pins Rust)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          clang --version
+      - run: ./build.sh
+      - name: workers_tls.wasm is built from src/
+        run: |
+          sha256sum workers_tls.wasm
+          test -z "$(git status --porcelain workers_tls.wasm)" || { echo "the committed workers_tls.wasm differs from this build"; exit 1; }

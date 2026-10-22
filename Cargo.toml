@@ -1,0 +1,22 @@
+[package]
+name = "workers-tls"
+version = "0.1.0"
+edition = "2021"
+description = "A TLS 1.2/1.3 client (rustls) as a byte-stream state machine for WebAssembly hosts: Cloudflare Workers sockets, with SNI, directly or through an HTTP CONNECT or SOCKS5 proxy."
+repository = "https://github.com/doedja/workers-tls"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
